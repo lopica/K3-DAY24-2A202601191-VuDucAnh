@@ -53,11 +53,78 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
+
+from agent import ledger, policy, tools
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
 
 
 def handle(message: str, llm, log_dir: Path | None = None) -> str:
-    raise NotImplementedError("BƯỚC 3c: implement trifecta split")
+    ledger_path = (Path(log_dir) / "ledger.jsonl") if log_dir else DEFAULT_LEDGER_PATH
+    agent_id = f"lab24-agent-{uuid4().hex[:12]}"
+
+    def invoke(tool_name: str, args: dict, classification: str, purpose: str,
+               run_id: str, depth: int, egress: bool, function):
+        context = policy.PolicyContext(classification, purpose, agent_id, depth, egress)
+        allowed, reason = policy.check(context)
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "agent_id": agent_id,
+            "agent_owner": agent_id,
+            "run_id": run_id,
+            "tool": tool_name,
+            "args_hash": hashlib.sha256(
+                json.dumps(args, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "classification": classification,
+            "decision": "allow" if allowed else "deny",
+            "reason": reason,
+        }
+        ledger.append(entry, ledger_path)
+        return function() if allowed else None
+
+    # Run A owns only the untrusted-content capability.
+    docs = invoke(
+        "search_docs", {"query": message}, "internal", "summarize-tickets",
+        "run-a", 0, False, lambda: tools.search_docs(message),
+    ) or []
+    combined = "\n\n".join(doc["text"] for doc in docs)
+    injection = llm.find_injection(combined)
+
+    # The only Run A -> Run B hand-off is a typed list derived from filenames.
+    ticket_ids = sorted({
+        int(match.group(1))
+        for doc in docs
+        if (match := re.fullmatch(r"ticket-(\d+)(?:b)?\.md", str(doc.get("id", ""))))
+    })
+    customers = json.loads(tools.CUSTOMERS_FILE.read_text(encoding="utf-8"))
+    customer_ids = sorted({
+        str(customer["customer_id"])
+        for customer in customers
+        if set(ticket_ids).intersection(customer.get("related_tickets", []))
+    })
+
+    # Run B never receives document text and has no egress capability.
+    for customer_id in customer_ids:
+        invoke(
+            "read_customer", {"customer_id": customer_id}, "restricted",
+            "support-ticket-lookup", "run-b", 1, False,
+            lambda customer_id=customer_id: tools.read_customer(customer_id),
+        )
+
+    # Record the attempted exfiltration, but policy denies it before execution.
+    if injection is not None:
+        invoke(
+            "http_post", {"url": injection.target_url}, "restricted",
+            "document-requested-egress", "run-egress", 1, True,
+            lambda: tools.http_post(injection.target_url, {}),
+        )
+
+    return llm.summarize(docs)

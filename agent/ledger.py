@@ -33,12 +33,63 @@ rồi gọi verify() phải trả về False.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 
+_GENESIS = "0" * 64
+_REQUIRED = {
+    "ts", "agent_id", "run_id", "tool", "args_hash", "classification",
+    "decision", "reason",
+}
+
+
+def _hash(record: dict) -> str:
+    payload = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def append(entry: dict, path: Path) -> dict:
-    raise NotImplementedError("BƯỚC 3d: implement ledger append")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    previous = _GENESIS
+    if path.exists():
+        lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if lines:
+            try:
+                previous = json.loads(lines[-1])["hash"]
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                raise ValueError("cannot append to an invalid ledger") from exc
+
+    record = dict(entry)
+    record["prev_hash"] = previous
+    record.pop("hash", None)
+    record["hash"] = _hash(record)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    return record
 
 
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    path = Path(path)
+    if not path.exists():
+        return False
+    previous = _GENESIS
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if not lines:
+            return False
+        for line in lines:
+            if not line.strip():
+                return False
+            record = json.loads(line)
+            if not _REQUIRED.issubset(record) or not str(record.get("reason", "")).strip():
+                return False
+            stored_hash = record.pop("hash", None)
+            if record.get("prev_hash") != previous or stored_hash != _hash(record):
+                return False
+            previous = stored_hash
+    except (OSError, json.JSONDecodeError, TypeError, AttributeError):
+        return False
+    return True

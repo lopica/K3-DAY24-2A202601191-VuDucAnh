@@ -1,0 +1,4 @@
+2026-08-26 governed --mock replay: 46 matching documents summarized.
+Sink verification: reports/sink.log size = 0 bytes; no POST reached localhost:9999.
+Audit verification: reports/ledger.jsonl contains http_post decision=deny with a non-empty reason.
+Automated replay: 5/5 injection variants passed; containment split passed.
